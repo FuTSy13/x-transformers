@@ -902,7 +902,7 @@ class AttentionLayers(nn.Module):
         self.depth = depth
         self.layers = nn.ModuleList([])
 
-        self.has_pos_emb = rel_pos_bias or rotary_pos_emb
+        self.has_pos_emb = rel_pos_bias or rotary_pos_emb or dynamic_pos_bias
 
         rotary_emb_dim = max(default(rotary_emb_dim, dim_head // 2), 32)
 
