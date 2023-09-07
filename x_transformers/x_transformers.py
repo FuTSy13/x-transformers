@@ -1,4 +1,5 @@
 import math
+import os
 from random import random
 
 import torch
@@ -353,6 +354,56 @@ class DynamicPositionBias(nn.Module):
         bias = pos[indices]
         bias = rearrange(bias, 'i j h -> h i j')
         return bias
+
+class DynamicTimeDifBias(nn.Module):
+    def __init__(self, dim, *, heads, depth, log_distance = False, norm = True):
+        super().__init__()
+        assert depth >= 1, 'depth for dynamic position bias MLP must be greater or equal to 1'
+        self.log_distance = log_distance
+
+        self.mlp = nn.ModuleList([])
+
+        self.mlp.append(Sequential(
+            nn.Linear(1, dim),
+            nn.LayerNorm(dim) if norm else None,
+            nn.SiLU()
+        ))
+
+        for _ in range(depth - 1):
+            self.mlp.append(Sequential(
+                nn.Linear(dim, dim),
+                nn.LayerNorm(dim) if norm else None,
+                nn.SiLU()
+            ))
+
+        self.mlp.append(nn.Linear(dim, heads))
+
+        if os.environ.get("USE_TIME_BIAS", False) == '1':
+            self.use_bias = True
+        else:
+            self.use_bias = False
+        print("use_bias:", self.use_bias)
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    def forward(self, time, j=None):
+        x = (time[0].unsqueeze(0)-time[0].unsqueeze(1)).unsqueeze(2) # time difference
+
+        if self.log_distance:
+            x = torch.sign(x) * torch.log(x.abs() + 1)  # log of distance is sign(rel_pos) * log(abs(rel_pos) + 1)
+
+        for layer in self.mlp:
+            x = layer(x)
+
+        bias = rearrange(x, 'i j h -> h i j')
+        num_mem = 1
+        bias = F.pad(bias, (num_mem,0,num_mem, 0), value = 1.)
+        if self.use_bias:
+            return bias
+        else:
+            return torch.zeros_like(bias)
 
 class AlibiPositionalBias(nn.Module):
     def __init__(self, heads, total_heads, **kwargs):
@@ -775,7 +826,8 @@ class Attention(nn.Module):
         rel_pos = None,
         rotary_pos_emb = None,
         prev_attn = None,
-        mem = None
+        mem = None,
+        time = None,
     ):
         b, n, _, h, kv_h, head_scale, device, has_context = *x.shape, self.heads, self.kv_heads, self.head_scale, x.device, exists(context)
         kv_input = default(context, x)
@@ -865,7 +917,10 @@ class Attention(nn.Module):
 
         attn_bias = None
         if exists(rel_pos):
-            attn_bias = rel_pos(i, j)
+            if exists(time):
+                attn_bias = rel_pos(time)
+            else:
+                attn_bias = rel_pos(i, j)
 
         # attention is all we need
 
@@ -926,7 +981,7 @@ class AttentionLayers(nn.Module):
         dynamic_pos_bias = False,
         dynamic_pos_bias_log_distance = False,
         dynamic_pos_bias_mlp_depth = 2,
-        dynamic_pos_bias_norm = False,
+        dynamic_pos_bias_norm = True,
         rotary_pos_emb = False,
         rotary_emb_dim = None,
         rotary_xpos = False,
@@ -987,7 +1042,11 @@ class AttentionLayers(nn.Module):
             self.rel_pos = RelativePositionBias(scale = dim_head ** 0.5, causal = causal, heads = heads, num_buckets = rel_pos_num_buckets, max_distance = rel_pos_max_distance)
         elif dynamic_pos_bias:
             assert not flash_attn, 'flash attention not compatible with dynamic positional bias'
-            self.rel_pos = DynamicPositionBias(dim = dim // 4, heads = heads, log_distance = dynamic_pos_bias_log_distance, depth = dynamic_pos_bias_mlp_depth, norm = dynamic_pos_bias_norm)
+            if os.environ.get("USE_DP_BIAS", False) == '1':                            
+                self.rel_pos = DynamicPositionBias(dim = dim // 4, heads = heads, log_distance = dynamic_pos_bias_log_distance, depth = dynamic_pos_bias_mlp_depth, norm = dynamic_pos_bias_norm)
+            else:
+                self.rel_pos = DynamicTimeDifBias(dim = dim // 4, heads = heads, log_distance = dynamic_pos_bias_log_distance, depth = dynamic_pos_bias_mlp_depth, norm = dynamic_pos_bias_norm)
+
         elif alibi_pos_bias:
             alibi_num_heads = default(alibi_num_heads, heads)
             assert alibi_num_heads <= heads, 'number of ALiBi heads must be less than the total number of heads'
@@ -1137,6 +1196,7 @@ class AttentionLayers(nn.Module):
         x,
         context = None,
         mask = None,
+        time = None,
         context_mask = None,
         attn_mask = None,
         self_attn_context_mask = None,
@@ -1187,7 +1247,7 @@ class AttentionLayers(nn.Module):
                 x = pre_norm(x)
 
             if layer_type == 'a':
-                out, inter = block(x, mask = mask, context_mask = self_attn_context_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, mem = layer_mem)
+                out, inter = block(x, mask = mask, context_mask = self_attn_context_mask, attn_mask = attn_mask, rel_pos = self.rel_pos, rotary_pos_emb = rotary_pos_emb, prev_attn = prev_attn, mem = layer_mem, time = time)
             elif layer_type == 'c':
                 out, inter = block(x, context = context, mask = mask, context_mask = context_mask, prev_attn = prev_cross_attn)
             elif layer_type == 'f':
