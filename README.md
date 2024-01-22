@@ -297,7 +297,7 @@ enc = Encoder(
 
 https://arxiv.org/abs/2006.11527
 
-Proposes adding learned tokens, akin to CLS tokens, named memory tokens, that is passed through the attention layers alongside the input tokens.
+Proposes adding learned tokens, akin to CLS tokens, named memory tokens, that is passed through the attention layers alongside the input tokens. This setting is compatible with both encoder and decoder training.
 
 ```python
 import torch
@@ -314,6 +314,8 @@ model = TransformerWrapper(
     )
 )
 ```
+
+Update: MetaAI researchers <a href="https://arxiv.org/abs/2309.16588">have found</a> that adding memory tokens (they call them register tokens), alleviates outliers (which is suspected now to be a pathology of attention networks unable to <a href="https://arxiv.org/abs/2306.12929">attend to nothing</a>).
 
 ### Transformers Without Tears
 
@@ -765,36 +767,9 @@ model = XTransformer(
 )
 ```
 
-### Deepnorm
-
-<img src="./images/deepnorm.png" width="450px"></img>
-
-It is well known that post-normalization transformers have trouble with stability, prompting the move to <a href="https://arxiv.org/abs/2002.04745">pre-normalization</a> in recent years, even though the latter sacrifices performance.
-
-This paper out of Microsoft research proposes a way to fix post-normalization stability. They achieve this by simply scaling the residual and proper initialization. They show they can train an one thousand layer transformer without stability issues, and achieve better results than pre-normalization.
-
-This was recently validated in a <a href="https://keg.cs.tsinghua.edu.cn/glm-130b/">130B GLM model</a> out of Tsinghua.
-
-
-```python
-import torch
-from x_transformers import TransformerWrapper, Decoder
-
-model = TransformerWrapper(
-    num_tokens = 20000,
-    max_seq_len = 1024,
-    attn_layers = Decoder(
-        deepnorm = True,     # set this to True to use deepnorm post-normalization configuration
-        dim = 512,
-        depth = 6,
-        heads = 8
-    )
-)
-```
-
 ### Transformer-XL recurrence
 
-You can also do Transformer-XL recurrence, by simply passing in a `max_mem_len` in the `TransformerWrapper` class, and then making sure your `Decoder` has `rel_pos_bias` set to `True`.
+You can also do Transformer-XL recurrence, by simply passing in a `max_mem_len` in the `TransformerWrapper` class, and then making sure your `Decoder` has `rel_pos_bias` (or `rotary_pos_emb`) set to `True`.
 
 Then, you can retrieve the memories at each step with the `return_mems` keyword and pass it to the next iteration.
 
@@ -965,6 +940,8 @@ Negative control - Sinusoidal
 More of Eric's experimental results can be found <a href="https://github.com/bob80333/investigating_extrapolation">here</a>
 
 You can use this type of relative position if you wish to train at smaller sequence lengths and have it generalize to longer ones, for both autoregressive and bidirectional models.
+
+Update: <a href="https://www.kaggle.com/competitions/stanford-ribonanza-rna-folding/discussion/460121">First place RNA folding using dynamic positional bias</a>
 
 ```python
 import torch
@@ -1194,6 +1171,8 @@ This flavor of attention also has <a href="https://arxiv.org/abs/2111.05498">a c
 
 Update: I have discovered a way to remove the learned temperature altogether, by grouping the feature dimension and doing l2-normalization on each group. This allows the queries and keys to have a similarity that is upper bounded by the number of groups. A group size of 8 or 16 was sufficient in my tests. Decided to name this technique "Grouped QK Normalization". The drawback is that I believe an attention head dimension 32 is too small to use this tactic (a dimension often used in vision)
 
+Update 2: Tero Karras has successfully used cosine sim attention in <a href="https://arxiv.org/abs/2312.02696">a new paper</a>.
+
 You can use it as follows
 
 ```python
@@ -1249,6 +1228,10 @@ We are nearing the point of wiping out a source of transformer training instabil
 Update: <a href="https://twitter.com/Tim_Dettmers/status/1625531080513306627">Counterpoint from Tim Dettmers</a>
 
 Update 2: <a href="https://arxiv.org/abs/2305.19268">Counter</a> to Tim's assertion that outliers are needed, and potentially even <a href="https://arxiv.org/abs/2306.12929">some solutions</a>
+
+Update 3: Used by <a href="https://www.adept.ai/blog/persimmon-8b">8B parameter LLM</a> successfully
+
+Update 4: a MetaAI group found that they can <a href="https://arxiv.org/abs/2309.16588">alleviate outliers</a> by adding `register tokens`, also known as `memory tokens` from earlier literature (Burtsev et al). Perhaps what should be tried next is see if qk norm can be improved in the presence of memory tokens.
 
 ```python
 import torch
@@ -1338,7 +1321,7 @@ loss.backward()
 
 ## Miscellaneous
 
-Cross Attention
+### Cross Attention
 
 ```python
 import torch
@@ -1358,7 +1341,7 @@ model(nodes, context = encoded_neighbors, mask = node_masks, context_mask = neig
 
 ```
 
-Pass in continuous values
+### Continuous Embeddings
 
 ```python
 import torch
@@ -1416,6 +1399,61 @@ loss.backward
 
 start_emb = torch.randn(1, 777)
 generated = model.generate(start_emb, 17) # (17, 777)
+```
+
+### xVal - Continuous and Discrete
+
+<img src="./images/xval.png" width="400px"></img>
+
+This is promising work that resulted from the collaboration across many institutes (collectively known as Polymathic AI). They found that by offering a continuously scaled number token to the transformer, the transformer was able to generalize arithmetic and forecasting tasks better than the alternative encoding schemes.
+
+This is corroborated by some [prior work](https://github.com/lucidrains/tab-transformer-pytorch#ft-transformer)
+
+```python
+import torch
+
+from x_transformers import (
+    Decoder,
+    XValTransformerWrapper,
+    XValAutoregressiveWrapper
+)
+
+model = XValTransformerWrapper(
+    num_tokens = 4,
+    numerical_token_id = 3,
+    max_seq_len = 1024,
+    attn_layers = Decoder(
+        dim = 512,
+        depth = 12,
+        heads = 8
+    )
+)
+
+# wrap it with the xval autoregressive wrapper
+
+model = XValAutoregressiveWrapper(model)
+
+# mock data
+
+ids = torch.randint(0, 4, (1, 777))
+nums = torch.randn(1, 777)
+mask = torch.ones(1, 777).bool()
+
+# train on a lot of data above
+
+loss = model(ids, nums, mask = mask)
+loss.backward()
+
+# then generate
+
+start_ids = torch.randint(0, 4, (1, 1))
+start_nums = torch.randn(1, 1)
+
+ids_out, num_out, is_number_mask = model.generate(start_ids, start_nums, 17)
+
+# (1, 17), (1, 17), (1, 17)
+
+# discrete, continuous, mask for discrete / continuous
 ```
 
 ## Citations
@@ -1848,16 +1886,6 @@ generated = model.generate(start_emb, 17) # (17, 777)
 ```
 
 ```bibtex
-@article{Wang2022DeepNetST,
-    title   = {DeepNet: Scaling Transformers to 1, 000 Layers},
-    author  = {Hongyu Wang and Shuming Ma and Li Dong and Shaohan Huang and Dongdong Zhang and Furu Wei},
-    journal = {ArXiv},
-    year    = {2022},
-    volume  = {abs/2203.00555}
-}
-```
-
-```bibtex
 @misc{schlag2020enhancing,
     title   = {Enhancing the Transformer with explicit relational encoding for math problem solving},
     author  = {Imanol Schlag and Paul Smolensky and Roland Fernandez and Nebojsa Jojic and J{\"u}rgen Schmidhuber and Jianfeng Gao},
@@ -1964,16 +1992,6 @@ generated = model.generate(start_emb, 17) # (17, 777)
 ```
 
 ```bibtex
-@article{Liu2023EfficientViTME,
-    title   = {EfficientViT: Memory Efficient Vision Transformer with Cascaded Group Attention},
-    author  = {Xinyu Liu and Houwen Peng and Ningxin Zheng and Yuqing Yang and Han Hu and Yixuan Yuan},
-    journal = {ArXiv},
-    year    = {2023},
-    volume  = {abs/2305.07027}
-}
-```
-
-```bibtex
 @article{Kazemnejad2023TheIO,
     title   = {The Impact of Positional Encoding on Length Generalization in Transformers},
     author  = {Amirhossein Kazemnejad and Inkit Padhi and Karthikeyan Natesan Ramamurthy and Payel Das and Siva Reddy},
@@ -1996,6 +2014,76 @@ generated = model.generate(start_emb, 17) # (17, 777)
     title   = {ST-MoE: Designing Stable and Transferable Sparse Expert Models},
     author  = {Barret Zoph and Irwan Bello and Sameer Kumar and Nan Du and Yanping Huang and Jeff Dean and Noam M. Shazeer and William Fedus},
     year    = {2022}
+}
+```
+
+```bibtex
+@article{Lan2019ALBERTAL,
+    title   = {ALBERT: A Lite BERT for Self-supervised Learning of Language Representations},
+    author  = {Zhenzhong Lan and Mingda Chen and Sebastian Goodman and Kevin Gimpel and Piyush Sharma and Radu Soricut},
+    journal = {ArXiv},
+    year    = {2019},
+    volume  = {abs/1909.11942},
+    url     = {https://api.semanticscholar.org/CorpusID:202888986}
+}
+```
+
+```bibtex
+@inproceedings{Li2022ContrastiveDO,
+    title   = {Contrastive Decoding: Open-ended Text Generation as Optimization},
+    author  = {Xiang Lisa Li and Ari Holtzman and Daniel Fried and Percy Liang and Jason Eisner and Tatsunori Hashimoto and Luke Zettlemoyer and Mike Lewis},
+    booktitle = {Annual Meeting of the Association for Computational Linguistics},
+    year    = {2022},
+    url     = {https://api.semanticscholar.org/CorpusID:253157949}
+}
+```
+
+```bibtex
+@inproceedings{OBrien2023ContrastiveDI,
+    title   = {Contrastive Decoding Improves Reasoning in Large Language Models},
+    author  = {Sean O'Brien and Mike Lewis},
+    year    = {2023},
+    url     = {https://api.semanticscholar.org/CorpusID:261884427}
+}
+```
+
+```bibtex
+@inproceedings{Darcet2023VisionTN,
+    title   = {Vision Transformers Need Registers},
+    author  = {Timoth'ee Darcet and Maxime Oquab and Julien Mairal and Piotr Bojanowski},
+    year    = {2023},
+    url     = {https://api.semanticscholar.org/CorpusID:263134283}
+}
+```
+
+```bibtex
+@article{Bondarenko2023QuantizableTR,
+    title   = {Quantizable Transformers: Removing Outliers by Helping Attention Heads Do Nothing},
+    author  = {Yelysei Bondarenko and Markus Nagel and Tijmen Blankevoort},
+    journal = {ArXiv},
+    year    = {2023},
+    volume  = {abs/2306.12929},
+    url     = {https://api.semanticscholar.org/CorpusID:259224568}
+}
+```
+
+```bibtex
+@inproceedings{Golkar2023xValAC,
+    title   = {xVal: A Continuous Number Encoding for Large Language Models},
+    author  = {Siavash Golkar and Mariel Pettee and Michael Eickenberg and Alberto Bietti and M. Cranmer and G{\'e}raud Krawezik and Francois Lanusse and Michael McCabe and Ruben Ohana and Liam Parker and Bruno R{\'e}galdo-Saint Blancard and Tiberiu Teşileanu and Kyunghyun Cho and Shirley Ho},
+    year    = {2023},
+    url     = {https://api.semanticscholar.org/CorpusID:263622222}
+}
+```
+
+```bibtex
+@article{Rafailov2023DirectPO,
+    title   = {Direct Preference Optimization: Your Language Model is Secretly a Reward Model},
+    author  = {Rafael Rafailov and Archit Sharma and Eric Mitchell and Stefano Ermon and Christopher D. Manning and Chelsea Finn},
+    journal = {ArXiv},
+    year    = {2023},
+    volume  = {abs/2305.18290},
+    url     = {https://api.semanticscholar.org/CorpusID:258959321}
 }
 ```
 
